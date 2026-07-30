@@ -472,22 +472,6 @@ async def ban_user(req: Dict[str, int], x_tg_id: int = Header(...)):
 @app.post("/api/admin/users/unban")
 async def unban_user(req: Dict[str, int], x_tg_id: int = Header(...)):
     if x_tg_id != MAIN_ADMIN_ID:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    
-    target_id = req.get("telegram_id")
-    db = read_db()
-    
-    if target_id in db["banned_users"]:
-        db["banned_users"].remove(target_id)
-        write_db_atomic(db)
-        
-    return {"status": "success"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-    if x_tg_id != MAIN_ADMIN_ID:
         raise HTTPException(status_code=403, detail="প্রবেশাধিকার নেই")
     target_id = req.get("telegram_id")
     db = read_db()
@@ -499,5 +483,3 @@ if __name__ == "__main__":
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
