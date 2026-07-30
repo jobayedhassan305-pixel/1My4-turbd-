@@ -480,10 +480,12 @@ async def unban_user(req: Dict[str, int], x_tg_id: int = Header(...)):
         write_db_atomic(db)
     return {"status": "success"}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
- Header(...)):
+@app.get("/some-endpoint")
+async def my_endpoint(
+    x_telegram_init_data: Optional[str] = Header(...)
+):
+    # আপনার কোডের বাকি অংশ
+
     if x_tg_id != MAIN_ADMIN_ID:
         raise HTTPException(status_code=403, detail="প্রবেশাধিকার নেই")
     target_id = req.get("telegram_id")
