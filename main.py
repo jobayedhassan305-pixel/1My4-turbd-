@@ -19,6 +19,8 @@ lock = filelock.FileLock(LOCK_FILE, timeout=10)
 
 app = FastAPI(title="Free Fire Esports Engine", version="7.0.0")
 
+app = FastAPI(title="Free Fire Esports Engine", version="7.0.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,6 +28,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 🟢 UptimeRobot-এর জন্য এই নতুন রুটটি যুক্ত করা হয়েছে
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "Server is up and running!"}
+
 
 def get_default_db() -> Dict[str, Any]:
     return {
