@@ -21,6 +21,7 @@ app = FastAPI(title="Free Fire Esports Engine", version="7.0.0")
 
 app = FastAPI(title="Free Fire Esports Engine", version="7.0.0")
 
+# main.py - :
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,10 +30,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🟢 UptimeRobot-এর জন্য এই নতুন রুটটি যুক্ত করা হয়েছে
-@app.get("/")
+# 🟢 [এখানে নতুন কোড যোগ করুন] line 30 থেকে:
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"status": "online", "message": "Server is up and running!"}
+    return {"status": "online", "message": "Free Fire Esports Engine is running!"}
 
 
 def get_default_db() -> Dict[str, Any]:
