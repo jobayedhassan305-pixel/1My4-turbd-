@@ -42,7 +42,8 @@ def get_default_db() -> Dict[str, Any]:
         "creators": {},
         "tournaments": {},
         "banned_users": [],
-        "announcements": [],  # List of dicts: {id, text, image_url, created_at}
+        "popup_announcement": "",
+        "announcements": [],
         "ad_views_count": 0
     }
 
@@ -59,6 +60,8 @@ def read_db() -> Dict[str, Any]:
                 for key in ["users", "creators", "tournaments", "banned_users", "announcements"]:
                     if key not in data:
                         data[key] = {} if key not in ["banned_users", "announcements"] else []
+                if "popup_announcement" not in data:
+                    data["popup_announcement"] = ""
                 if "ad_views_count" not in data:
                     data["ad_views_count"] = 0
                 return data
@@ -70,6 +73,9 @@ def read_db() -> Dict[str, Any]:
                 except Exception:
                     pass
             return get_default_db()
+
+
+                
 
 def write_db_atomic_internal(data: Dict[str, Any]):
     if os.path.exists(DATA_FILE):
