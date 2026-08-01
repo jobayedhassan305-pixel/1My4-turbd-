@@ -1,7 +1,10 @@
+
 import os
 import time
 import json
 import uuid
+import hmac
+import hashlib
 import asyncio
 from typing import Dict, List, Optional, Any
 from fastapi import FastAPI, HTTPException, Header
@@ -14,14 +17,12 @@ LOCK_FILE = f"{DATA_FILE}.lock"
 BACKUP_FILE = f"{DATA_FILE}.bak"
 
 MAIN_ADMIN_ID = int(os.getenv("MAIN_ADMIN_ID", "8908999062"))
+SERVER_SECRET_KEY = os.getenv("SERVER_SECRET_KEY", "FF_ESPORTS_SUPER_SECRET_KEY_998877")
 
 lock = filelock.FileLock(LOCK_FILE, timeout=10)
 
 app = FastAPI(title="Free Fire Esports Engine", version="7.0.0")
 
-app = FastAPI(title="Free Fire Esports Engine", version="7.0.0")
-
-# main.py - :
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,11 +31,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🟢 [এখানে নতুন কোড যোগ করুন] line 30 থেকে:
-@app.api_route("/", methods=["GET", "HEAD"])
-async def root():
-    return {"status": "online", "message": "Free Fire Esports Engine is running!"}
-
+def generate_signed_token(tg_id: int, role: str, squad_code: str) -> str: # সিকিউর ভেরিফিকেশন টোকেন
+    exp = int(time.time()) + 300
+    payload = f"{tg_id}:{role}:{squad_code}:{exp}"
+    signature = hmac.new(SERVER_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}:{signature}"
 
 def get_default_db() -> Dict[str, Any]:
     return {
@@ -42,8 +43,7 @@ def get_default_db() -> Dict[str, Any]:
         "creators": {},
         "tournaments": {},
         "banned_users": [],
-        "popup_announcement": "",
-        "announcements": [],
+        "announcements": [],  # List of dicts: {id, text, image_url, created_at}
         "ad_views_count": 0
     }
 
@@ -60,8 +60,6 @@ def read_db() -> Dict[str, Any]:
                 for key in ["users", "creators", "tournaments", "banned_users", "announcements"]:
                     if key not in data:
                         data[key] = {} if key not in ["banned_users", "announcements"] else []
-                if "popup_announcement" not in data:
-                    data["popup_announcement"] = ""
                 if "ad_views_count" not in data:
                     data["ad_views_count"] = 0
                 return data
@@ -73,9 +71,6 @@ def read_db() -> Dict[str, Any]:
                 except Exception:
                     pass
             return get_default_db()
-
-
-                
 
 def write_db_atomic_internal(data: Dict[str, Any]):
     if os.path.exists(DATA_FILE):
@@ -314,7 +309,14 @@ async def register_leader(reg: LeaderRegistration, x_tg_id: int = Header(...)):
         schedule_tournament_deletion(t_id, 1020)
 
     write_db_atomic(db)
-    return {"status": "success", "squad_code": squad_code, "task_link": t["task_link"]}
+    
+    auth_token = generate_signed_token(x_tg_id, "leader", squad_code)
+    return {
+        "status": "success", 
+        "squad_code": squad_code, 
+        "task_link": t["task_link"],
+        "auth_token": auth_token
+    }
 
 @app.post("/api/tournaments/join-squad")
 async def join_squad(req: JoinSquadByCode, x_tg_id: int = Header(...)):
@@ -346,7 +348,14 @@ async def join_squad(req: JoinSquadByCode, x_tg_id: int = Header(...)):
         schedule_tournament_deletion(target_tournament["id"], 1020)
 
     write_db_atomic(db)
-    return {"status": "success", "message": "স্কোয়াডে জয়েন সফল হয়েছে!", "task_link": target_tournament["task_link"]}
+    
+    auth_token = generate_signed_token(x_tg_id, "member", req.squad_code)
+    return {
+        "status": "success", 
+        "message": "স্কোয়াডে জয়েন সফল হয়েছে!", 
+        "task_link": target_tournament["task_link"],
+        "auth_token": auth_token
+    }
 
 @app.get("/api/user/my-squads")
 async def get_my_squads(x_tg_id: int = Header(...)):
@@ -498,3 +507,5 @@ async def unban_user(req: Dict[str, int], x_tg_id: int = Header(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
