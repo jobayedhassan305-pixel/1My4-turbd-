@@ -1,6 +1,12 @@
 import json
 import os
 import secrets
+import time
+import hmac
+import hashlib
+import asyncio
+import re
+from datetime import datetime
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Header, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +15,7 @@ from filelock import FileLock
 
 DB_FILE = "db.json"
 LOCK_FILE = "db.json.lock"
+SERVER_SECRET_KEY = "FF_ESPORTS_SUPER_SECRET_KEY_998877"
 
 app = FastAPI(title="Esports MiniApp Backend API")
 
@@ -22,7 +29,7 @@ app.add_middleware(
 
 MAIN_ADMIN_ID = 8908999062
 
-# --- DB HELPERS WITH AUTOMATIC HEALING & RETRIES ---
+# --- DB HELPERS ---
 
 def get_db() -> Dict[str, Any]:
     if not os.path.exists(DB_FILE):
@@ -67,6 +74,52 @@ def get_user_role(db: Dict[str, Any], tg_id: int) -> str:
         return "CREATOR"
     return "USER"
 
+def generate_signed_gateway_token(tg_id: int, role: str, squad_code: str) -> str:
+    exp = int(time.time()) + 3600  # 1 hour expiration
+    payload = f"{tg_id}:{role}:{squad_code}:{exp}"
+    signature = hmac.new(SERVER_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}:{signature}"
+
+# --- AUTOMATIC TOURNAMENT CLEANUP TASK ---
+async def auto_cleanup_tournaments():
+    while True:
+        try:
+            db = get_db()
+            now = time.time()
+            modified = False
+
+            for t_id, t in list(db.get("tournaments", {}).items()):
+                start_ts = t.get("start_timestamp")
+                # Parse string start_time if timestamp not explicitly set
+                if not start_ts and t.get("start_time"):
+                    try:
+                        # Attempt ISO parse or standard format
+                        dt = datetime.fromisoformat(t["start_time"].replace("Z", "+00:00"))
+                        start_ts = dt.timestamp()
+                    except Exception:
+                        start_ts = None
+
+                # 7 mins grace period + 5 mins threshold = 12 mins (720 seconds)
+                if start_ts and (now - start_ts) > 720:
+                    room_id = t.get("room_id", "")
+                    room_pass = t.get("room_password", "")
+                    if not room_id or not room_pass or room_id == "PROTECTED":
+                        print(f"🗑 Auto-deleting tournament {t_id} due to missing room details after 12 mins!")
+                        del db["tournaments"][t_id]
+                        modified = True
+
+            if modified:
+                save_db(db)
+
+        except Exception as e:
+            print("Auto-cleanup task error:", e)
+
+        await asyncio.sleep(60)  # Check every 1 minute
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(auto_cleanup_tournaments())
+
 # --- SCHEMAS ---
 
 class AuthInitRequest(BaseModel):
@@ -74,10 +127,6 @@ class AuthInitRequest(BaseModel):
     username: Optional[str] = ""
     first_name: Optional[str] = "Player"
     photo_url: Optional[str] = ""
-
-class VerifyUserRequest(BaseModel):
-    ff_uid: str
-    whatsapp_number: str
 
 class RegisterLeaderRequest(BaseModel):
     tournament_id: str
@@ -141,8 +190,6 @@ def auth_init(req: AuthInitRequest):
             "username": req.username or "",
             "first_name": req.first_name or "Player",
             "photo_url": req.photo_url or "",
-            "ff_uid": "",
-            "whatsapp": "",
             "joined_tournaments": []
         }
     else:
@@ -163,29 +210,6 @@ def auth_init(req: AuthInitRequest):
         "is_unlocked": is_unlocked,
         "announcements": db.get("announcements", [])
     }
-
-@app.post("/api/user/verify")
-def verify_user(req: VerifyUserRequest, x_tg_id: str = Header(None)):
-    if not x_tg_id:
-        raise HTTPException(status_code=401, detail="Telegram ID missing")
-    
-    db = get_db()
-    if x_tg_id not in db["users"]:
-        db["users"][x_tg_id] = {
-            "telegram_id": int(x_tg_id),
-            "username": "",
-            "first_name": "Player",
-            "photo_url": "",
-            "ff_uid": req.ff_uid,
-            "whatsapp": req.whatsapp_number,
-            "joined_tournaments": []
-        }
-    else:
-        db["users"][x_tg_id]["ff_uid"] = req.ff_uid
-        db["users"][x_tg_id]["whatsapp"] = req.whatsapp_number
-
-    save_db(db)
-    return {"status": "success", "user": db["users"][x_tg_id]}
 
 @app.get("/api/tournaments")
 def get_tournaments(x_tg_id: str = Header(None)):
@@ -229,8 +253,19 @@ def register_leader(req: RegisterLeaderRequest, x_tg_id: str = Header(None)):
         raise HTTPException(status_code=404, detail="Tournament Not Found")
 
     t = db["tournaments"][t_id]
-    if len(t.get("squads", {})) >= 12:
+    squads = t.get("squads", {})
+
+    if len(squads) >= 12:
         raise HTTPException(status_code=400, detail="টুর্নামেন্ট ফুল হয়ে গেছে (১২/১২ স্কোয়াড)!")
+
+    # Check 1: Ensure user is not already a leader or member of any squad in this tournament
+    for sq in squads.values():
+        for member in sq.get("members", []):
+            if str(member.get("tg_id")) == str(x_tg_id):
+                raise HTTPException(
+                    status_code=400, 
+                    detail="আপনি ইতিমধ্যে এই টুর্নামেন্টের একটি স্কোয়াডে যুক্ত আছেন! একাধিক স্কোয়াডে জয়েন করা যাবে না।"
+                )
 
     squad_code = secrets.token_hex(3).upper()
     
@@ -258,7 +293,8 @@ def register_leader(req: RegisterLeaderRequest, x_tg_id: str = Header(None)):
 
     save_db(db)
 
-    auth_token = secrets.token_urlsafe(16)
+    # Correct HMAC-signed token generation compatible with Gateway SDK
+    auth_token = generate_signed_gateway_token(int(x_tg_id), "leader", squad_code)
     task_link = t.get("task_link") or "https://google.com"
 
     return {
@@ -277,10 +313,19 @@ def join_squad(req: JoinSquadRequest, x_tg_id: str = Header(None)):
     found_squad = None
     target_tournament = None
 
+    # Check 1: User cannot join if already in ANY squad of this tournament
     for t_id, t in db.get("tournaments", {}).items():
         if req.squad_code in t.get("squads", {}):
             found_squad = t["squads"][req.squad_code]
             target_tournament = t
+
+            for sq in t.get("squads", {}).values():
+                for member in sq.get("members", []):
+                    if str(member.get("tg_id")) == str(x_tg_id):
+                        raise HTTPException(
+                            status_code=400, 
+                            detail="আপনি ইতিমধ্যে এই টুর্নামেন্টের একটি স্কোয়াডে জয়েন করে আছেন!"
+                        )
             break
 
     if not found_squad:
@@ -298,7 +343,8 @@ def join_squad(req: JoinSquadRequest, x_tg_id: str = Header(None)):
 
     save_db(db)
     
-    auth_token = secrets.token_urlsafe(16)
+    # Correct HMAC-signed token generation compatible with Gateway SDK
+    auth_token = generate_signed_gateway_token(int(x_tg_id), "member", req.squad_code)
     task_link = target_tournament.get("task_link") or "https://google.com"
 
     return {
@@ -344,13 +390,11 @@ def delete_squad(sq_code: str, x_tg_id: str = Header(None)):
     for t_id, t in db.get("tournaments", {}).items():
         if sq_code in t.get("squads", {}):
             sq = t["squads"][sq_code]
-            # লিডার বা এডমিন স্কোয়াড মুছে দিতে পারবে
             if str(sq.get("leader_tg_id")) == str(x_tg_id) or str(x_tg_id) == str(MAIN_ADMIN_ID):
                 del t["squads"][sq_code]
                 removed = True
                 break
             else:
-                # মেম্বার হলে স্কোয়াড থেকে বের হবে
                 sq["members"] = [m for m in sq["members"] if str(m.get("tg_id")) != str(x_tg_id)]
                 removed = True
                 break
@@ -405,6 +449,15 @@ def create_tournament(req: CreateTournamentRequest, x_tg_id: str = Header(None))
         raise HTTPException(status_code=403, detail="আপনার টুর্নামেন্ট তৈরি করার অনুমতি নেই!")
 
     t_id = "tourn_" + secrets.token_hex(4)
+
+    # Try parsing start_time as timestamp if possible
+    start_ts = None
+    try:
+        dt = datetime.fromisoformat(req.start_time.replace("Z", "+00:00"))
+        start_ts = dt.timestamp()
+    except Exception:
+        start_ts = time.time()  # Fallback to creation timestamp
+
     db["tournaments"][t_id] = {
         "creator_id": int(x_tg_id),
         "title": req.title,
@@ -414,6 +467,7 @@ def create_tournament(req: CreateTournamentRequest, x_tg_id: str = Header(None))
         "task_link": req.task_link,
         "rules": req.rules,
         "start_time": req.start_time,
+        "start_timestamp": start_ts,
         "squads": {},
         "room_id": "",
         "room_password": "",
@@ -557,3 +611,4 @@ def import_database(json_data: Dict[str, Any] = Body(...), x_tg_id: str = Header
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
