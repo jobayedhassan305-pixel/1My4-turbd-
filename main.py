@@ -5,10 +5,9 @@ import time
 import hmac
 import hashlib
 import asyncio
-import re
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, Header, Depends, Body
+from fastapi import FastAPI, HTTPException, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from filelock import FileLock
@@ -90,21 +89,19 @@ async def auto_cleanup_tournaments():
 
             for t_id, t in list(db.get("tournaments", {}).items()):
                 start_ts = t.get("start_timestamp")
-                # Parse string start_time if timestamp not explicitly set
                 if not start_ts and t.get("start_time"):
                     try:
-                        # Attempt ISO parse or standard format
                         dt = datetime.fromisoformat(t["start_time"].replace("Z", "+00:00"))
                         start_ts = dt.timestamp()
                     except Exception:
                         start_ts = None
 
-                # 7 mins grace period + 5 mins threshold = 12 mins (720 seconds)
+                # 7 mins grace + 5 mins = 12 mins (720 seconds)
                 if start_ts and (now - start_ts) > 720:
                     room_id = t.get("room_id", "")
                     room_pass = t.get("room_password", "")
                     if not room_id or not room_pass or room_id == "PROTECTED":
-                        print(f"🗑 Auto-deleting tournament {t_id} due to missing room details after 12 mins!")
+                        print(f"🗑 Auto-deleting tournament {t_id} due to missing room credentials!")
                         del db["tournaments"][t_id]
                         modified = True
 
@@ -114,7 +111,7 @@ async def auto_cleanup_tournaments():
         except Exception as e:
             print("Auto-cleanup task error:", e)
 
-        await asyncio.sleep(60)  # Check every 1 minute
+        await asyncio.sleep(60)
 
 @app.on_event("startup")
 async def startup_event():
@@ -128,16 +125,19 @@ class AuthInitRequest(BaseModel):
     first_name: Optional[str] = "Player"
     photo_url: Optional[str] = ""
 
-class RegisterLeaderRequest(BaseModel):
+class PlayerMember(BaseModel):
+    nickname: str  # Mandatory FF Style Name
+    ff_id: Optional[str] = ""  # Optional FF UID
+
+class RegisterFullSquadRequest(BaseModel):
     tournament_id: str
     squad_name: str
-    p1_nickname: str
-    p1_ff_id: str
+    members: List[PlayerMember]  # Up to 4 players submitted together by leader
 
 class JoinSquadRequest(BaseModel):
     squad_code: str
-    nickname: str
-    ff_id: str
+    nickname: str  # Mandatory FF Style Name
+    ff_id: Optional[str] = ""  # Optional FF UID
 
 class UploadRoomRequest(BaseModel):
     tournament_id: str
@@ -149,6 +149,7 @@ class CreateTournamentRequest(BaseModel):
     title: str
     code: str
     prize: str
+    task_type: Optional[str] = "LINK"  # "MONETAG_AD" or "LINK"
     task_description: Optional[str] = ""
     task_link: Optional[str] = ""
     rules: Optional[str] = ""
@@ -173,6 +174,9 @@ class CreatorAddRequest(BaseModel):
 
 class BanUserRequest(BaseModel):
     telegram_id: int
+
+class OfflineSyncPayload(BaseModel):
+    registrations: List[RegisterFullSquadRequest]
 
 # --- API ENDPOINTS ---
 
@@ -243,7 +247,7 @@ def get_tournaments(x_tg_id: str = Header(None)):
     return {"tournaments": tournaments_list}
 
 @app.post("/api/tournaments/register-leader")
-def register_leader(req: RegisterLeaderRequest, x_tg_id: str = Header(None)):
+def register_leader(req: RegisterFullSquadRequest, x_tg_id: str = Header(None)):
     if not x_tg_id:
         raise HTTPException(status_code=401, detail="Telegram ID Missing")
         
@@ -258,29 +262,39 @@ def register_leader(req: RegisterLeaderRequest, x_tg_id: str = Header(None)):
     if len(squads) >= 12:
         raise HTTPException(status_code=400, detail="টুর্নামেন্ট ফুল হয়ে গেছে (১২/১২ স্কোয়াড)!")
 
-    # Check 1: Ensure user is not already a leader or member of any squad in this tournament
+    # Check: Ensure user is not already in a squad for this tournament
     for sq in squads.values():
         for member in sq.get("members", []):
             if str(member.get("tg_id")) == str(x_tg_id):
                 raise HTTPException(
                     status_code=400, 
-                    detail="আপনি ইতিমধ্যে এই টুর্নামেন্টের একটি স্কোয়াডে যুক্ত আছেন! একাধিক স্কোয়াডে জয়েন করা যাবে না।"
+                    detail="আপনি ইতিমধ্যে এই টুর্নামেন্টের একটি স্কোয়াডে যুক্ত আছেন!"
                 )
+
+    if not req.members or len(req.members) == 0:
+        raise HTTPException(status_code=400, detail="কমপক্ষে লিডারের তথ্য দেওয়া বাধ্যতামূলক!")
+
+    # Validate mandatory Free Fire Style Name
+    for idx, m in enumerate(req.members):
+        if not m.nickname or not m.nickname.strip():
+            raise HTTPException(status_code=400, detail=f"প্লেয়ার {idx+1} এর ফ্রি ফায়ার স্টাইল নাম প্রদান করা আবশ্যক!")
 
     squad_code = secrets.token_hex(3).upper()
     
+    formatted_members = []
+    for idx, m in enumerate(req.members):
+        formatted_members.append({
+            "tg_id": int(x_tg_id) if idx == 0 else 0, # Leader has actual TG ID
+            "nickname": m.nickname.strip(),
+            "ff_id": (m.ff_id or "N/A").strip(),
+            "role": "LEADER" if idx == 0 else f"PLAYER_{idx+1}"
+        })
+
     new_squad = {
         "squad_name": req.squad_name,
         "squad_code": squad_code,
         "leader_tg_id": int(x_tg_id),
-        "members": [
-            {
-                "tg_id": int(x_tg_id),
-                "nickname": req.p1_nickname,
-                "ff_id": req.p1_ff_id,
-                "role": "LEADER"
-            }
-        ]
+        "members": formatted_members
     }
 
     if "squads" not in t: t["squads"] = {}
@@ -293,13 +307,13 @@ def register_leader(req: RegisterLeaderRequest, x_tg_id: str = Header(None)):
 
     save_db(db)
 
-    # Correct HMAC-signed token generation compatible with Gateway SDK
     auth_token = generate_signed_gateway_token(int(x_tg_id), "leader", squad_code)
     task_link = t.get("task_link") or "https://google.com"
 
     return {
         "status": "success",
         "squad_code": squad_code,
+        "task_type": t.get("task_type", "LINK"),
         "task_link": task_link,
         "auth_token": auth_token
     }
@@ -309,11 +323,13 @@ def join_squad(req: JoinSquadRequest, x_tg_id: str = Header(None)):
     if not x_tg_id:
         raise HTTPException(status_code=401, detail="Telegram ID Missing")
 
+    if not req.nickname or not req.nickname.strip():
+        raise HTTPException(status_code=400, detail="ফ্রি ফায়ার স্টাইল নাম প্রদান করা আবশ্যক!")
+
     db = get_db()
     found_squad = None
     target_tournament = None
 
-    # Check 1: User cannot join if already in ANY squad of this tournament
     for t_id, t in db.get("tournaments", {}).items():
         if req.squad_code in t.get("squads", {}):
             found_squad = t["squads"][req.squad_code]
@@ -336,22 +352,38 @@ def join_squad(req: JoinSquadRequest, x_tg_id: str = Header(None)):
 
     found_squad["members"].append({
         "tg_id": int(x_tg_id),
-        "nickname": req.nickname,
-        "ff_id": req.ff_id,
+        "nickname": req.nickname.strip(),
+        "ff_id": (req.ff_id or "N/A").strip(),
         "role": "MEMBER"
     })
 
     save_db(db)
     
-    # Correct HMAC-signed token generation compatible with Gateway SDK
     auth_token = generate_signed_gateway_token(int(x_tg_id), "member", req.squad_code)
     task_link = target_tournament.get("task_link") or "https://google.com"
 
     return {
         "status": "success",
+        "task_type": target_tournament.get("task_type", "LINK"),
         "task_link": task_link,
         "auth_token": auth_token
     }
+
+@app.post("/api/sync-offline")
+def sync_offline_registrations(payload: OfflineSyncPayload, x_tg_id: str = Header(None)):
+    """ Offline Fallback Sync Endpoint """
+    if not x_tg_id:
+        raise HTTPException(status_code=401, detail="Telegram ID Missing")
+
+    synced_count = 0
+    for reg in payload.registrations:
+        try:
+            register_leader(reg, x_tg_id=x_tg_id)
+            synced_count += 1
+        except Exception:
+            pass
+
+    return {"status": "success", "synced_count": synced_count}
 
 @app.get("/api/user/my-squads")
 def get_my_squads(x_tg_id: str = Header(None)):
@@ -448,24 +480,29 @@ def create_tournament(req: CreateTournamentRequest, x_tg_id: str = Header(None))
     if role not in ["CREATOR", "MAIN_ADMIN"]:
         raise HTTPException(status_code=403, detail="আপনার টুর্নামেন্ট তৈরি করার অনুমতি নেই!")
 
+    # Role specific task enforcement
+    task_type = req.task_type or "LINK"
+    if role == "CREATOR" and task_type == "MONETAG_AD":
+        task_type = "LINK" # Sub admin defaults to website link
+
     t_id = "tourn_" + secrets.token_hex(4)
 
-    # Try parsing start_time as timestamp if possible
     start_ts = None
     try:
         dt = datetime.fromisoformat(req.start_time.replace("Z", "+00:00"))
         start_ts = dt.timestamp()
     except Exception:
-        start_ts = time.time()  # Fallback to creation timestamp
+        start_ts = time.time()
 
     db["tournaments"][t_id] = {
         "creator_id": int(x_tg_id),
         "title": req.title,
         "code": req.code,
         "prize": req.prize,
-        "task_description": req.task_description,
-        "task_link": req.task_link,
-        "rules": req.rules,
+        "task_type": task_type,
+        "task_description": req.task_description or "",
+        "task_link": req.task_link or "",
+        "rules": req.rules or "",
         "start_time": req.start_time,
         "start_timestamp": start_ts,
         "squads": {},
